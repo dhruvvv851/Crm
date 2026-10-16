@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Customers - Airmen CRM</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="header"></div>
+
+  <div class="pagehead">
+    <h2>Customers</h2>
+    <div class="crumb"><a href="/index.html">Home</a> &gt; Customers</div>
+  </div>
+
+  <div class="content">
+    <div class="panel">
+      <h3>Add customer</h3>
+      <div class="form-grid">
+        <input id="name" placeholder="Company Name">
+        <input id="contact_person" placeholder="Contact Person">
+        <input id="contact_designation" placeholder="Contact Designation">
+        <input id="phone" placeholder="Phone">
+        <input id="phone2" placeholder="Phone 2">
+        <input id="email" placeholder="Email">
+        <input id="city" placeholder="City">
+      </div>
+      <div class="field" style="margin-top:12px">
+        <textarea id="address" rows="3" placeholder="Address"></textarea>
+      </div>
+      <button class="btn" onclick="addCustomer()">Add Customer</button>
+    </div>
+
+    <div class="panel">
+      <h3>All customers</h3>
+      <input id="search" placeholder="Search by company, person, phone or city" style="width:100%" oninput="render()">
+      <table>
+        <thead><tr><th>ID</th><th>Company</th><th>Contact Person</th><th>Phone</th><th>City</th></tr></thead>
+        <tbody id="list"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script src="/layout.js"></script>
+  <script>
+    const fields = ['name', 'contact_person', 'contact_designation', 'phone', 'phone2', 'email', 'city', 'address'];
+    let customers = [];
+
+    async function loadCustomers() {
+      const res = await fetch('/api/customers');
+      customers = await res.json();
+      render();
+    }
+
+    function render() {
+      const q = document.getElementById('search').value.toLowerCase();
+      const list = document.getElementById('list');
+      list.innerHTML = '';
+      for (const c of customers) {
+        const text = [c.name, c.contact_person, c.phone, c.city].join(' ').toLowerCase();
+        if (!text.includes(q)) continue;
+        const tr = document.createElement('tr');
+        for (const value of [c.id, c.name, c.contact_person, c.phone, c.city]) {
+          const td = document.createElement('td');
+          td.textContent = value || '';
+          tr.appendChild(td);
+        }
+        list.appendChild(tr);
+      }
+    }
+
+    async function addCustomer() {
+      const data = {};
+      for (const f of fields) {
+        data[f] = document.getElementById(f).value;
+      }
+      const res = await fetch('/api/customers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (!res.ok) {
+        alert((await res.json()).error);
+        return;
+      }
+      for (const f of fields) {
+        document.getElementById(f).value = '';
+      }
+      loadCustomers();
+    }
+
+    loadCustomers();
+  </script>
+</body>
+</html>
