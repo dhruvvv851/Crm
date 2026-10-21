@@ -152,4 +152,34 @@ db.exec(`
 
   UPDATE commissions SET pdf_file = '' WHERE COALESCE(pdf_file, '') != '';
 `);
+addColumn('calls', 'account_id', 'INTEGER');
+addColumn('calls', 'commission_id', 'INTEGER');
+addColumn('calls', 'call_no', 'TEXT');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS call_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    call_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    technician_id INTEGER,
+    check_in TEXT,
+    check_out TEXT,
+    total_minutes INTEGER,
+    running_hours INTEGER,
+    load_hours INTEGER,
+    contact_person TEXT,
+    contact_phone TEXT,
+    contact_email TEXT,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+addColumn('call_steps', 'reason', 'TEXT');
+addColumn('call_steps', 'from_technician_id', 'INTEGER');
+addColumn('call_steps', 'check_in_lat', 'REAL');
+addColumn('call_steps', 'check_in_lng', 'REAL');
+addColumn('call_steps', 'check_out_lat', 'REAL');
+addColumn('call_steps', 'check_out_lng', 'REAL');
+
+db.exec("UPDATE call_steps SET status = 'Swiped' WHERE status = 'Reassigned'");
 module.exports = db;

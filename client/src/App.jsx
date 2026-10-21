@@ -2,6 +2,9 @@ import { Routes, Route } from 'react-router-dom'
 import Layout from './components/Layout'
 import SoftLayout from './components/SoftLayout'
 import Dashboard from './pages/Dashboard'
+import AddCall from './pages/AddCall'
+import CallHistory from './pages/CallHistory'
+import ViewCall from './pages/ViewCall'
 import Customers from './pages/Customers'
 import AddCustomer from './pages/AddCustomer'
 import CustomerView from './pages/CustomerView'
@@ -20,6 +23,9 @@ export default function App() {
     <Routes>
       <Route element={<Layout />}>
         <Route path="/" element={<Dashboard />} />
+        <Route path="/add-call" element={<AddCall />} />
+        <Route path="/calls" element={<CallHistory />} />
+        <Route path="/calls/:id" element={<ViewCall />} />
         <Route path="/customers" element={<Customers />} />
         <Route path="/customers/add" element={<AddCustomer />} />
         <Route path="/customers/:id" element={<CustomerView />} />

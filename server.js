@@ -158,8 +158,11 @@ app.get('/api/dashboard', (req, res) => {
     models: count('SELECT COUNT(*) AS n FROM models'),
     parts: count('SELECT COUNT(*) AS n FROM parts'),
     recentCalls: db.prepare(`
-      SELECT calls.id, calls.created_at, customers.name AS customer
-      FROM calls JOIN customers ON customers.id = calls.customer_id
+      SELECT calls.id, calls.call_no, calls.created_at,
+             COALESCE(a.name, cu.name) AS customer
+      FROM calls
+      LEFT JOIN accounts a ON a.id = calls.account_id
+      LEFT JOIN customers cu ON cu.id = calls.customer_id
       ORDER BY calls.id DESC LIMIT 5
     `).all(),
     technicianList: db.prepare('SELECT id, name FROM technicians ORDER BY name').all()
@@ -167,41 +170,256 @@ app.get('/api/dashboard', (req, res) => {
 });
 
 // ---------- Calls ----------
+const VISITS = ['AMC', 'Warranty', 'Goodwill', 'Chargeable', 'AMC/Payment Followup'];
+const PRIORITIES = ['Low Priority', 'Medium Priority', 'High Priority'];
+
+function nextCallNo() {
+  const d = new Date();
+  const prefix =
+    String(d.getFullYear()).slice(2) +
+    String(d.getMonth() + 1).padStart(2, '0') +
+    String(d.getDate()).padStart(2, '0');
+  const row = db.prepare('SELECT MAX(call_no) AS m FROM calls WHERE call_no LIKE ?').get(prefix + '%');
+  const next = row.m ? Number(row.m.slice(6)) + 1 : 1;
+  return prefix + String(next).padStart(4, '0');
+}
+
+function ensureFirstStep(call) {
+  const has = db.prepare('SELECT id FROM call_steps WHERE call_id = ? LIMIT 1').get(call.id);
+  if (!has) {
+    db.prepare("INSERT INTO call_steps (call_id, status, technician_id, created_at) VALUES (?, 'Pending', ?, ?)")
+      .run(call.id, call.technician_id, call.created_at);
+  }
+}
+
+function pendingCall(id, res) {
+  const call = db.prepare('SELECT * FROM calls WHERE id = ?').get(id);
+  if (!call) {
+    res.status(404).json({ error: 'Call not found' });
+    return null;
+  }
+  if (call.status !== 'Pending') {
+    res.status(400).json({ error: 'Only a pending call can be changed' });
+    return null;
+  }
+  ensureFirstStep(call);
+  return call;
+}
+
+function wholeOrNull(v) {
+  const t = toText(v);
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isInteger(n) && n >= 0 ? n : NaN;
+}
+
+function readCoord(v, limit) {
+  const t = toText(v);
+  if (!t) return null;
+  const n = Number(t);
+  return Number.isFinite(n) && Math.abs(n) <= limit ? n : NaN;
+}
+
+app.get('/api/call-options', (req, res) => {
+  res.json({ visits: VISITS, priorities: PRIORITIES });
+});
+
+app.get('/api/accounts/:id/machines', (req, res) => {
+  res.json(db.prepare(`
+    SELECT cm.id, cm.part_no, cm.serial_no, m.name AS model_name, e.name AS equipment_name
+    FROM commissions cm
+    LEFT JOIN models m ON m.id = cm.model_id
+    LEFT JOIN masters e ON e.id = cm.equipment_id
+    WHERE cm.account_id = ?
+    ORDER BY m.name, cm.serial_no
+  `).all(Number(req.params.id)));
+});
+
 app.get('/api/calls', (req, res) => {
   res.json(db.prepare(`
-    SELECT calls.id, calls.problem, calls.status, calls.created_at, customers.name AS customer
-    FROM calls JOIN customers ON customers.id = calls.customer_id
+    SELECT calls.id, calls.call_no, calls.problem, calls.status, calls.nature_of_visit,
+           calls.priority, calls.call_date, calls.created_at, calls.technician_id,
+           COALESCE(a.name, cu.name) AS customer, t.name AS technician_name
+    FROM calls
+    LEFT JOIN accounts a ON a.id = calls.account_id
+    LEFT JOIN customers cu ON cu.id = calls.customer_id
+    LEFT JOIN technicians t ON t.id = calls.technician_id
     ORDER BY calls.id DESC
   `).all());
 });
 
-app.post('/api/calls', (req, res) => {
-  const { customer_id, model_id, technician_id, problem, nature_of_visit, priority, call_date } = req.body;
+app.get('/api/calls/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const call = db.prepare(`
+    SELECT calls.*, COALESCE(a.name, cu.name) AS company,
+           COALESCE(a.address, cu.address) AS address,
+           COALESCE(a.contact_person, cu.contact_person) AS contact_person,
+           t.name AS technician_name,
+           m.name AS model_name, cm.part_no, cm.serial_no, e.name AS equipment_name
+    FROM calls
+    LEFT JOIN accounts a ON a.id = calls.account_id
+    LEFT JOIN customers cu ON cu.id = calls.customer_id
+    LEFT JOIN technicians t ON t.id = calls.technician_id
+    LEFT JOIN commissions cm ON cm.id = calls.commission_id
+    LEFT JOIN models m ON m.id = cm.model_id
+    LEFT JOIN masters e ON e.id = cm.equipment_id
+    WHERE calls.id = ?
+  `).get(id);
+  if (!call) return res.status(404).json({ error: 'Call not found' });
 
-  const customer = db.prepare('SELECT id FROM customers WHERE id = ?').get(Number(customer_id));
-  if (!customer) {
-    return res.status(400).json({ error: 'Please select a company' });
-  }
-  if (!problem || !problem.trim()) {
-    return res.status(400).json({ error: 'Please write the nature of the problem' });
-  }
-
-  const result = db.prepare(`
-    INSERT INTO calls
-      (customer_id, model_id, technician_id, problem, nature_of_visit, priority, call_date)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    customer.id,
-    model_id ? Number(model_id) : null,
-    technician_id ? Number(technician_id) : null,
-    problem.trim(),
-    nature_of_visit || '',
-    priority || 'Low Priority',
-    call_date || ''
-  );
-  res.json({ ok: true, id: Number(result.lastInsertRowid) });
+  ensureFirstStep(call);
+  const steps = db.prepare(`
+    SELECT s.*, t.name AS technician_name, f.name AS from_technician_name
+    FROM call_steps s
+    LEFT JOIN technicians t ON t.id = s.technician_id
+    LEFT JOIN technicians f ON f.id = s.from_technician_id
+    WHERE s.call_id = ?
+    ORDER BY s.id
+  `).all(id);
+  const summary = db.prepare(`
+    SELECT COALESCE(SUM(CASE WHEN status = 'Swiped' THEN 1 ELSE 0 END), 0) AS swipes,
+           COALESCE(SUM(CASE WHEN check_in IS NOT NULL THEN 1 ELSE 0 END), 0) AS visits,
+           COALESCE(SUM(total_minutes), 0) AS minutes
+    FROM call_steps WHERE call_id = ?
+  `).get(id);
+  res.json({ call, steps, summary });
 });
 
+app.post('/api/calls', (req, res) => {
+  const accountId = toId(req.body.account_id);
+  const technicianId = toId(req.body.technician_id);
+  const commissionId = toId(req.body.commission_id);
+  const problem = toText(req.body.problem);
+  const visit = toText(req.body.nature_of_visit);
+  const priority = toText(req.body.priority) || 'Low Priority';
+  const date = toText(req.body.call_date);
+
+  if (!accountId || !db.prepare('SELECT id FROM accounts WHERE id = ?').get(accountId)) {
+    return res.status(400).json({ error: 'Please select a company' });
+  }
+  if (commissionId && !db.prepare('SELECT id FROM commissions WHERE id = ? AND account_id = ?').get(commissionId, accountId)) {
+    return res.status(400).json({ error: 'The selected machine does not belong to this company' });
+  }
+  if (!technicianId || !db.prepare('SELECT id FROM technicians WHERE id = ?').get(technicianId)) {
+    return res.status(400).json({ error: 'Please select a technician' });
+  }
+  if (!VISITS.includes(visit)) {
+    return res.status(400).json({ error: 'Please select the nature of visit' });
+  }
+  if (!problem) {
+    return res.status(400).json({ error: 'Please write the nature of the problem' });
+  }
+  if (!PRIORITIES.includes(priority)) {
+    return res.status(400).json({ error: 'Priority is not valid' });
+  }
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return res.status(400).json({ error: 'Call date is not valid' });
+  }
+
+  const callNo = nextCallNo();
+  const result = db.prepare(`
+    INSERT INTO calls
+      (customer_id, account_id, commission_id, technician_id, problem, nature_of_visit, priority, call_date, call_no)
+    VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(accountId, commissionId, technicianId, problem, visit, priority, date, callNo);
+  const id = Number(result.lastInsertRowid);
+  db.prepare("INSERT INTO call_steps (call_id, status, technician_id) VALUES (?, 'Pending', ?)").run(id, technicianId);
+  res.json({ ok: true, id, call_no: callNo });
+});
+
+app.post('/api/calls/:id/swipe', (req, res) => {
+  const call = pendingCall(Number(req.params.id), res);
+  if (!call) return;
+  const technicianId = toId(req.body.technician_id);
+  const reason = toText(req.body.reason);
+  if (!technicianId || !db.prepare('SELECT id FROM technicians WHERE id = ?').get(technicianId)) {
+    return res.status(400).json({ error: 'Please select a technician' });
+  }
+  if (technicianId === call.technician_id) {
+    return res.status(400).json({ error: 'This call is already assigned to that technician' });
+  }
+  if (!reason) {
+    return res.status(400).json({ error: 'Please write the swipe call reason' });
+  }
+  db.prepare('UPDATE calls SET technician_id = ? WHERE id = ?').run(technicianId, call.id);
+  db.prepare(
+    "INSERT INTO call_steps (call_id, status, technician_id, from_technician_id, reason) VALUES (?, 'Swiped', ?, ?, ?)"
+  ).run(call.id, technicianId, call.technician_id, reason);
+  res.json({ ok: true });
+});
+
+app.post('/api/calls/:id/cancel', (req, res) => {
+  const call = pendingCall(Number(req.params.id), res);
+  if (!call) return;
+  db.prepare("UPDATE calls SET status = 'Cancelled' WHERE id = ?").run(call.id);
+  db.prepare("INSERT INTO call_steps (call_id, status, technician_id) VALUES (?, 'Cancelled', ?)").run(call.id, call.technician_id);
+  res.json({ ok: true });
+});
+
+// ---------- Field engineer app (will be protected by login later) ----------
+app.post('/api/field/calls/:id/visit', (req, res) => {
+  const call = pendingCall(Number(req.params.id), res);
+  if (!call) return;
+
+  const technicianId = toId(req.body.technician_id);
+  if (technicianId !== call.technician_id) {
+    return res.status(403).json({ error: 'This call is not assigned to this technician' });
+  }
+
+  const timeFormat = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
+  const checkIn = toText(req.body.check_in);
+  const checkOut = toText(req.body.check_out);
+  if (!timeFormat.test(checkIn) || !timeFormat.test(checkOut)) {
+    return res.status(400).json({ error: 'Please send the check in and check out time' });
+  }
+  const minutes = Math.round((new Date(checkOut) - new Date(checkIn)) / 60000);
+  if (!(minutes >= 0)) {
+    return res.status(400).json({ error: 'Check out time must be after check in time' });
+  }
+
+  const outcome = toText(req.body.outcome);
+  if (!['Pending', 'Complete'].includes(outcome)) {
+    return res.status(400).json({ error: 'Outcome must be Pending or Complete' });
+  }
+  const reason = toText(req.body.reason);
+  if (outcome === 'Pending' && !reason) {
+    return res.status(400).json({ error: 'Please write the pending call reason' });
+  }
+
+  const inLat = readCoord(req.body.check_in_lat, 90);
+  const inLng = readCoord(req.body.check_in_lng, 180);
+  const outLat = readCoord(req.body.check_out_lat, 90);
+  const outLng = readCoord(req.body.check_out_lng, 180);
+  if ([inLat, inLng, outLat, outLng].some(Number.isNaN)) {
+    return res.status(400).json({ error: 'The location is not valid' });
+  }
+
+  const running = wholeOrNull(req.body.running_hours);
+  const load = wholeOrNull(req.body.load_hours);
+  if (Number.isNaN(running) || Number.isNaN(load)) {
+    return res.status(400).json({ error: 'Running hours and load hours must be whole numbers' });
+  }
+  const email = toText(req.body.contact_email);
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Contact email is not valid' });
+  }
+
+  db.prepare(`
+    INSERT INTO call_steps
+      (call_id, status, technician_id, reason, check_in, check_out, total_minutes,
+       check_in_lat, check_in_lng, check_out_lat, check_out_lng,
+       running_hours, load_hours, contact_person, contact_phone, contact_email)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    call.id, outcome, call.technician_id, reason, checkIn, checkOut, minutes,
+    inLat, inLng, outLat, outLng, running, load,
+    toText(req.body.contact_person), toText(req.body.contact_phone), email
+  );
+  if (outcome === 'Complete') {
+    db.prepare("UPDATE calls SET status = 'Complete' WHERE id = ?").run(call.id);
+  }
+  res.json({ ok: true });
+});
 // ---------- Masters: segment, city, area, equipment ----------
 const MASTERS = {
   segment: { parent: null },

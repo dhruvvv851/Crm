@@ -73,7 +73,7 @@ export default function Dashboard() {
                   <div>
                     <div className="time">{localTime(c.created_at)}</div>
                     <div>New Call Added for {c.customer}</div>
-                    <div>Call ID : {callId(c.id)}</div>
+                    <div>Call ID : {c.call_no || callId(c.id)}</div>
                   </div>
                 </div>
               ))}
