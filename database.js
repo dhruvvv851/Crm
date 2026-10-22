@@ -1,5 +1,6 @@
 const { DatabaseSync } = require('node:sqlite');
-const db = new DatabaseSync('crm.db');
+const path = require('path');
+const db = new DatabaseSync(path.join(__dirname, 'crm.db'));
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS customers (
@@ -182,4 +183,27 @@ addColumn('call_steps', 'check_out_lat', 'REAL');
 addColumn('call_steps', 'check_out_lng', 'REAL');
 
 db.exec("UPDATE call_steps SET status = 'Swiped' WHERE status = 'Reassigned'");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    technician_id INTEGER,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+addColumn('users', 'permissions', 'TEXT');
+addColumn('users', 'last_login', 'TEXT');
+
 module.exports = db;

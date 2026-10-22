@@ -3,6 +3,9 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const db = require('./database');
+const crypto = require('crypto');
+const { hashPassword, verifyPassword } = require('./auth');
+const { PERMISSIONS, ALL_KEYS } = require('./permissions');
 
 const app = express();
 app.use(express.json());
@@ -11,6 +14,182 @@ app.use(express.static('public'));
 function count(sql) {
   return db.prepare(sql).get().n;
 }
+// ---------- Login and sessions ----------
+const SESSION_HOURS = { admin: 12, engineer: 24 * 30 };
+const DUMMY_HASH = hashPassword('dummy-password-for-timing');
+const failedLogins = new Map();
+const LOCK_MS = 15 * 60 * 1000;
+
+function sha256(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie || '';
+  for (const part of header.split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) {
+      try {
+        return decodeURIComponent(part.slice(i + 1).trim());
+      } catch (e) {
+        return '';
+      }
+    }
+  }
+  return '';
+}
+
+function setSessionCookie(res, token, seconds) {
+  res.setHeader('Set-Cookie', 'sid=' + token + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + seconds);
+}
+
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
+}
+
+function effectivePermissions(row) {
+  if (row.role !== 'admin') return [];
+  if (row.permissions == null) return ALL_KEYS;
+  try {
+    return JSON.parse(row.permissions).filter(k => ALL_KEYS.includes(k));
+  } catch (e) {
+    return [];
+  }
+}
+
+function loadUser(req, res, next) {
+  req.user = null;
+  const token = readCookie(req, 'sid');
+  if (token) {
+    const row = db.prepare(`
+      SELECT u.id, u.username, u.role, u.technician_id, u.permissions, t.name AS technician_name
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      LEFT JOIN technicians t ON t.id = u.technician_id
+      WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1
+    `).get(sha256(token), Date.now());
+    if (row) {
+      req.user = {
+        id: row.id,
+        username: row.username,
+        role: row.role,
+        technician_id: row.technician_id,
+        technician_name: row.technician_name,
+        permissions: effectivePermissions(row)
+      };
+    }
+  }
+  next();
+}
+
+app.use('/api', loadUser);
+
+app.post('/api/login', (req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Please enter the username and password' });
+  }
+
+  const key = req.ip + '|' + username.toLowerCase();
+  const tries = failedLogins.get(key);
+  if (tries && tries.count >= 5 && Date.now() - tries.first < LOCK_MS) {
+    return res.status(429).json({ error: 'Too many wrong attempts. Please try again after 15 minutes.' });
+  }
+
+  const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  const passwordOk = verifyPassword(password, user ? user.password_hash : DUMMY_HASH);
+  if (!user || !passwordOk || !user.active) {
+    const now = Date.now();
+    const rec = tries && now - tries.first < LOCK_MS ? tries : { count: 0, first: now };
+    rec.count += 1;
+    failedLogins.set(key, rec);
+    return res.status(401).json({ error: 'Wrong username or password' });
+  }
+  failedLogins.delete(key);
+    db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
+
+  const token = crypto.randomBytes(32).toString('hex');
+  const seconds = 3600 * (SESSION_HOURS[user.role] || 12);
+  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+  db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
+    .run(sha256(token), user.id, Date.now() + seconds * 1000);
+  setSessionCookie(res, token, seconds);
+  res.json({ ok: true, role: user.role });
+});
+
+app.post('/api/logout', (req, res) => {
+  const token = readCookie(req, 'sid');
+  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get('/api/me', (req, res) => {
+  if (!req.user) return res.status(401).json({ error: 'Not logged in' });
+  res.json(req.user);
+});
+
+// Everything below this line needs a login
+app.use('/api', (req, res, next) => {
+  if (!req.user) return res.status(401).json({ error: 'Please log in' });
+  next();
+});
+
+// Field engineers may only use the /api/field addresses
+app.use('/api', (req, res, next) => {
+  if (req.user.role === 'engineer' && !req.path.startsWith('/field')) {
+    return res.status(403).json({ error: 'Not allowed' });
+  }
+  next();
+});
+
+app.use('/api/field', (req, res, next) => {
+  if (req.user.role !== 'engineer') {
+    return res.status(403).json({ error: 'Only field engineers can use this' });
+  }
+  next();
+});
+// Office users: what each address needs
+const OPEN_READS = [
+  ['GET', /^\/(technicians|models|call-options)$/],
+  ['GET', /^\/masters\/\w+$/],
+  ['GET', /^\/accounts(\/\d+(\/machines)?)?$/]
+];
+
+const RULES = [
+  ['GET', /^\/dashboard$/, 'dashboard'],
+  ['GET', /^\/calls$/, 'call_history'],
+  ['GET', /^\/calls\/\d+$/, 'call_view'],
+  ['POST', /^\/calls$/, 'add_call'],
+  ['POST', /^\/calls\/\d+\/swipe$/, 'call_edit'],
+  ['POST', /^\/calls\/\d+\/cancel$/, 'call_cancel'],
+  ['GET', /^\/customers(\/\d+(\/quotations)?)?$/, ['company_list', 'create_uqn']],
+  ['GET', /^\/quotations$/, ['company_list', 'create_uqn']],
+  ['POST', /^\/(customers|quotations)$/, 'create_uqn'],
+  ['POST', /^\/technicians$/, 'add_user'],
+  ['PUT', /^\/technicians\/\d+$/, 'edit_user'],
+  ['POST', /^\/(models|masters\/\w+)$/, 'masters'],
+  ['PUT', /^\/(models|masters\/\w+)\/\d+$/, 'masters'],
+  ['DELETE', /^\/masters\/\w+\/\d+$/, 'masters'],
+  ['POST', /^\/accounts$/, 'accounts'],
+  ['PUT', /^\/accounts\/\d+$/, 'accounts'],
+  ['DELETE', /^\/accounts\/\d+$/, 'accounts'],
+  ['*', /^\/(commissions|attachments)(\/|$)/, 'commission'],
+  ['*', /^\/(users|permissions)(\/|$)/, 'administrator']
+];
+
+app.use('/api', (req, res, next) => {
+  if (req.user.role !== 'admin') return next();
+  if (OPEN_READS.some(([method, re]) => method === req.method && re.test(req.path))) return next();
+
+  const rule = RULES.find(([method, re]) => (method === '*' || method === req.method) && re.test(req.path));
+  const need = rule ? [].concat(rule[2]) : [];
+  if (!need.some(key => req.user.permissions.includes(key))) {
+    return res.status(403).json({ error: 'You do not have permission for this' });
+  }
+  next();
+});
 
 // ---------- Customers (Sales) ----------
 app.get('/api/customers', (req, res) => {
@@ -361,9 +540,8 @@ app.post('/api/field/calls/:id/visit', (req, res) => {
   const call = pendingCall(Number(req.params.id), res);
   if (!call) return;
 
-  const technicianId = toId(req.body.technician_id);
-  if (technicianId !== call.technician_id) {
-    return res.status(403).json({ error: 'This call is not assigned to this technician' });
+   if (req.user.technician_id !== call.technician_id) {
+    return res.status(403).json({ error: 'This call is not assigned to you' });
   }
 
   const timeFormat = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
@@ -848,6 +1026,107 @@ app.delete('/api/commissions/:id', (req, res) => {
   db.prepare('DELETE FROM attachments WHERE commission_id = ?').run(id);
   db.prepare('DELETE FROM commissions WHERE id = ?').run(id);
   files.forEach(f => removeStored(f.stored));
+  res.json({ ok: true });
+});
+// ---------- Office users and permissions ----------
+function cleanPermissions(list) {
+  if (!Array.isArray(list)) return null;
+  return ALL_KEYS.filter(key => list.includes(key));
+}
+
+function otherAdmins(exceptId) {
+  const rows = db.prepare("SELECT role, permissions FROM users WHERE role = 'admin' AND active = 1 AND id != ?").all(exceptId);
+  return rows.filter(r => effectivePermissions(r).includes('administrator')).length;
+}
+
+function userRow(u) {
+  return {
+    id: u.id,
+    username: u.username,
+    last_login: u.last_login,
+    permissions: effectivePermissions(u)
+  };
+}
+
+app.get('/api/permissions', (req, res) => {
+  res.json(PERMISSIONS);
+});
+
+app.get('/api/users', (req, res) => {
+  const rows = db.prepare("SELECT * FROM users WHERE role = 'admin' ORDER BY username").all();
+  res.json(rows.map(userRow));
+});
+
+app.post('/api/users', (req, res) => {
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password || '');
+  const permissions = cleanPermissions(req.body.permissions);
+
+  if (!/^[A-Za-z0-9._-]{3,40}$/.test(username)) {
+    return res.status(400).json({ error: 'Username must be 3 to 40 characters: letters, numbers, dot, dash or underscore' });
+  }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'The password must be at least 8 characters' });
+  }
+  if (!permissions) {
+    return res.status(400).json({ error: 'Permissions are not valid' });
+  }
+  if (db.prepare('SELECT id FROM users WHERE username = ?').get(username)) {
+    return res.status(400).json({ error: 'This username already exists' });
+  }
+
+  const result = db.prepare(
+    "INSERT INTO users (username, password_hash, role, permissions) VALUES (?, ?, 'admin', ?)"
+  ).run(username, hashPassword(password), JSON.stringify(permissions));
+  res.json({ ok: true, id: Number(result.lastInsertRowid) });
+});
+
+app.put('/api/users/:id', (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'admin'").get(id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const permissions = cleanPermissions(req.body.permissions);
+  if (!permissions) return res.status(400).json({ error: 'Permissions are not valid' });
+
+  const wasAdministrator = effectivePermissions(user).includes('administrator');
+  if (wasAdministrator && !permissions.includes('administrator') && otherAdmins(id) === 0) {
+    return res.status(400).json({ error: 'At least one active user must keep the Admin List (administrator) permission' });
+  }
+
+  db.prepare('UPDATE users SET permissions = ? WHERE id = ?').run(JSON.stringify(permissions), id);
+  res.json({ ok: true });
+});
+
+app.put('/api/users/:id/password', (req, res) => {
+  const id = Number(req.params.id);
+  const user = db.prepare("SELECT id FROM users WHERE id = ? AND role = 'admin'").get(id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const password = String(req.body.password || '');
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'The password must be at least 8 characters' });
+  }
+
+  db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(password), id);
+  const keep = id === req.user.id ? sha256(readCookie(req, 'sid')) : '';
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash != ?').run(id, keep);
+  res.json({ ok: true });
+});
+
+app.delete('/api/users/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (id === req.user.id) {
+    return res.status(400).json({ error: 'You cannot delete your own account' });
+  }
+  const user = db.prepare("SELECT * FROM users WHERE id = ? AND role = 'admin'").get(id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  if (effectivePermissions(user).includes('administrator') && otherAdmins(id) === 0) {
+    return res.status(400).json({ error: 'You cannot delete the last administrator' });
+  }
+  db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+  db.prepare('DELETE FROM users WHERE id = ?').run(id);
   res.json({ ok: true });
 });
 
