@@ -40,7 +40,8 @@ function readCookie(req, name) {
 }
 
 function setSessionCookie(res, token, seconds) {
-  res.setHeader('Set-Cookie', 'sid=' + token + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=' + seconds);
+  const age = seconds ? '; Max-Age=' + seconds : '';
+  res.setHeader('Set-Cookie', 'sid=' + token + '; HttpOnly; SameSite=Lax; Path=/' + age);
 }
 
 function clearSessionCookie(res) {
@@ -110,11 +111,17 @@ app.post('/api/login', (req, res) => {
     db.prepare('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?').run(user.id);
 
   const token = crypto.randomBytes(32).toString('hex');
-  const seconds = 3600 * (SESSION_HOURS[user.role] || 12);
+    const remember = req.body.remember !== false;
+  let seconds = 3600 * (SESSION_HOURS[user.role] || 12);
+  let keepCookie = true;
+  if (user.role === 'admin') {
+    seconds = remember ? 3600 * 24 * 7 : 3600 * 12;
+    keepCookie = remember;
+  }
   db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
   db.prepare('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)')
     .run(sha256(token), user.id, Date.now() + seconds * 1000);
-  setSessionCookie(res, token, seconds);
+   setSessionCookie(res, token, keepCookie ? seconds : 0);
   res.json({ ok: true, role: user.role });
 });
 
